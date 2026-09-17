@@ -102,18 +102,25 @@ public:
     }
 
     static juce::File findPianoSamplesDir() {
-        const juce::StringArray candidatePaths = {
-            "/usr/local/google/home/mhorowitzgelb/improv_pulse/piano_samples",
-            "./piano_samples",
-            "../piano_samples",
-            "../../piano_samples"
+        std::vector<juce::File> searchRoots = {
+            juce::File::getCurrentWorkingDirectory(),
+            juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory()
         };
-        for (const auto& path : candidatePaths) {
-            juce::File f (path);
-            if (f.isDirectory() && f.getChildFile ("manifest.csv").existsAsFile())
-                return f;
+
+        for (auto dir : searchRoots) {
+            for (int depth = 0; depth < 6; ++depth) {
+                juce::File candidate = dir.getChildFile ("piano_samples");
+                if (candidate.isDirectory() && candidate.getChildFile ("manifest.csv").existsAsFile())
+                    return candidate;
+                dir = dir.getParentDirectory();
+            }
         }
-        return juce::File ("/usr/local/google/home/mhorowitzgelb/improv_pulse/piano_samples");
+
+        juce::File linuxDefault ("/usr/local/google/home/mhorowitzgelb/improv_pulse/piano_samples");
+        if (linuxDefault.isDirectory())
+            return linuxDefault;
+
+        return juce::File::getCurrentWorkingDirectory().getChildFile ("piano_samples");
     }
 
     void run() override {
