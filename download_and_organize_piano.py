@@ -258,7 +258,7 @@ def main():
             })
             
     # Save manifest.json
-    with open(os.path.join(OUTPUT_DIR, "manifest.json"), "w") as f:
+    with open(os.path.join(OUTPUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump({
             'instrument': "Steinway & Sons Model B Grand Piano",
             'performer': "Evan Mazunik",
@@ -280,7 +280,7 @@ def main():
         }, f, indent=2)
     
     # Save manifest.csv
-    with open(os.path.join(OUTPUT_DIR, "manifest.csv"), "w", newline="") as f:
+    with open(os.path.join(OUTPUT_DIR, "manifest.csv"), "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=[
             'note', 'midi_number', 'pitch', 'octave', 'frequency_hz',
             'dynamic', 'velocity_min', 'velocity_max', 'exists',
@@ -363,7 +363,7 @@ def main():
         lines.append(f"<region> sample=pp/Piano.pp.Bb0.{ext} key=22 lovel=1 hivel=95")
         lines.append("")
 
-        with open(filepath, "w") as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
     generate_sfz(os.path.join(OUTPUT_DIR, "piano.sfz"), is_wav=False)
@@ -434,7 +434,7 @@ sampler.addSound(new juce::SamplerSound("Piano_C4", *reader, midiNotes, 60, 0.0,
 ### Standard SFZ Samplers
 Load either `piano.sfz` (for AIFF) or `piano_wav.sfz` (for WAV) into any SFZ-compatible plugin or sampler engine (e.g. SFZero in JUCE, Sforzando, DecentSampler, LinuxSampler).
 """
-    with open(os.path.join(OUTPUT_DIR, "README.md"), "w") as f:
+    with open(os.path.join(OUTPUT_DIR, "README.md"), "w", encoding="utf-8") as f:
         f.write(readme_content)
         
     print("All tasks finished successfully!")
