@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.15)
-project(PianoDemo VERSION 1.0.0 LANGUAGES C CXX)
+project(sfz_instrument_loader VERSION 1.0.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
 include(FetchContent)
@@ -22,42 +22,26 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(JUCE)
 
-if(UNIX AND NOT APPLE)
-    set(JUCE_CURL_ARG NEEDS_CURL TRUE)
-else()
-    set(JUCE_CURL_ARG "")
-endif()
-
-juce_add_gui_app(PianoDemo
-    PRODUCT_NAME "PianoDemo"
-    BUNDLE_ID "com.improvpulse.pianodemo"
-    IS_COMMAND_LINE_APPLICATION FALSE
-    ${JUCE_CURL_ARG}
+juce_add_console_app(sfz_instrument_loader
+    PRODUCT_NAME "sfz_instrument_loader"
 )
 
-target_sources(PianoDemo PRIVATE
+target_sources(sfz_instrument_loader PRIVATE
     main.cpp
-    ../sfz_instrument_loader/SfzInstrumentLoader.cpp
+    SfzInstrumentLoader.cpp
 )
 
-target_include_directories(PianoDemo PRIVATE
-    ../sfz_instrument_loader
-)
-
-target_compile_definitions(PianoDemo PRIVATE
+target_compile_definitions(sfz_instrument_loader PRIVATE
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
 )
 
-if(UNIX AND NOT APPLE)
-    target_compile_definitions(PianoDemo PRIVATE JUCE_JACK=1)
-endif()
-
-target_link_libraries(PianoDemo PRIVATE
-    juce::juce_audio_utils
+target_link_libraries(sfz_instrument_loader PRIVATE
+    juce::juce_audio_basics
     juce::juce_audio_formats
-    juce::juce_gui_extra
+    juce::juce_core
+    juce::juce_events
+    juce::juce_gui_basics
     juce::juce_recommended_config_flags
-    juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags
 )

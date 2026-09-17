@@ -11,14 +11,21 @@ Makefile
 *.dylib
 *.exe
 
-# Exclude 2.7 GB raw audio recordings (can be downloaded via download_and_organize_piano.py)
-# Keep manifest.csv, manifest.json, piano.sfz, piano_wav.sfz, and README.md
-piano_samples/ff/
-piano_samples/mf/
-piano_samples/pp/
-piano_samples/wav/
+# Exclude downloaded Accurate Salamander Grand Piano V6.2 files
+# Users should download the soundbank from https://www.ir.isas.jaxa.jp/~cyamauch/AccurateSalamander/
+# and extract it into sfz_instrument_loader/salamander_piano/
+sfz_instrument_loader/salamander_piano/
+sfz_instrument_loader/48khz24bit
+sfz_instrument_loader/sfz_daw
+sfz_instrument_loader/sfz_live
+sfz_instrument_loader/sfz_minimum
+salamander_piano/
+*.wav
+*.zip
 
-# IDE and OS files
+# IDE, swap, and OS files
 .vscode/
 .idea/
 .DS_Store
+*.swp
+*~

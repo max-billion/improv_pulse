@@ -1,307 +1,11 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_audio_formats/juce_audio_formats.h>
+#include "SfzInstrumentLoader.h"
 #include <atomic>
 #include <cmath>
 #include <iostream>
 #include <vector>
-
-//==============================================================================
-// Custom SamplerSound supporting velocity ranges (pp, mf, ff)
-//==============================================================================
-class PianoSamplerSound : public juce::SamplerSound {
-public:
-    PianoSamplerSound (const juce::String& soundName,
-                       juce::AudioFormatReader& source,
-                       const juce::BigInteger& targetMidiNotes,
-                       int midiNoteForNormalPitch,
-                       double attackTimeSecs,
-                       double releaseTimeSecs,
-                       double maxSampleLengthSeconds,
-                       int velMin,
-                       int velMax)
-        : juce::SamplerSound (soundName, source, targetMidiNotes, midiNoteForNormalPitch,
-                              attackTimeSecs, releaseTimeSecs, maxSampleLengthSeconds),
-          minVelocity (velMin),
-          maxVelocity (velMax) {}
-
-    bool appliesToVelocity (int midiVelocity) const noexcept {
-        return midiVelocity >= minVelocity && midiVelocity <= maxVelocity;
-    }
-
-private:
-    int minVelocity = 1;
-    int maxVelocity = 127;
-};
-
-//==============================================================================
-// Custom Synthesiser routing noteOn by velocity layer
-//==============================================================================
-class PianoSynthesiser : public juce::Synthesiser {
-public:
-    void noteOn (int midiChannel, int midiNoteNumber, float velocity) override {
-        const juce::ScopedLock sl (lock);
-        const int midiVel = juce::jlimit (1, 127, juce::roundToInt (velocity * 127.0f));
-
-        // First try exact velocity match
-        bool triggered = false;
-        for (auto* sound : sounds) {
-            if (sound->appliesToNote (midiNoteNumber) && sound->appliesToChannel (midiChannel)) {
-                if (auto* pianoSound = dynamic_cast<PianoSamplerSound*> (sound)) {
-                    if (! pianoSound->appliesToVelocity (midiVel))
-                        continue;
-                }
-                triggerSound (sound, midiChannel, midiNoteNumber, velocity);
-                triggered = true;
-            }
-        }
-
-        // Fallback if only one dynamic layer is loaded so far
-        if (! triggered) {
-            for (auto* sound : sounds) {
-                if (sound->appliesToNote (midiNoteNumber) && sound->appliesToChannel (midiChannel)) {
-                    triggerSound (sound, midiChannel, midiNoteNumber, velocity);
-                    break;
-                }
-            }
-        }
-    }
-
-private:
-    void triggerSound (juce::SynthesiserSound* sound, int midiChannel, int midiNoteNumber, float velocity) {
-        for (auto* voice : voices) {
-            if (voice->getCurrentlyPlayingNote() == midiNoteNumber && voice->isPlayingChannel (midiChannel))
-                stopVoice (voice, 1.0f, true);
-        }
-        startVoice (findFreeVoice (sound, midiChannel, midiNoteNumber, isNoteStealingEnabled()),
-                    sound, midiChannel, midiNoteNumber, velocity);
-    }
-};
-
-//==============================================================================
-// Background thread to load & trim Steinway Model B WAV samples
-//==============================================================================
-class SampleLoaderThread : public juce::Thread {
-public:
-    SampleLoaderThread (PianoSynthesiser& targetSynth, std::function<void()> onReadyCallback)
-        : juce::Thread ("SteinwaySampleLoader"),
-          synth (targetSynth),
-          onReady (std::move (onReadyCallback)) {}
-
-    ~SampleLoaderThread() override {
-        stopThread (4000);
-    }
-
-    float getProgress() const noexcept { return progress.load(); }
-    int getLoadedCount() const noexcept { return loadedCount.load(); }
-    int getTotalCount() const noexcept { return totalCount.load(); }
-    bool isPrimaryReady() const noexcept { return primaryReady.load(); }
-    juce::String getStatusText() const {
-        const juce::ScopedLock sl (statusLock);
-        return statusMessage;
-    }
-
-    static juce::File findPianoSamplesDir() {
-        std::vector<juce::File> searchRoots = {
-            juce::File::getCurrentWorkingDirectory(),
-            juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory()
-        };
-
-        for (auto dir : searchRoots) {
-            for (int depth = 0; depth < 6; ++depth) {
-                juce::File candidate = dir.getChildFile ("piano_samples");
-                if (candidate.isDirectory() && candidate.getChildFile ("manifest.csv").existsAsFile())
-                    return candidate;
-                dir = dir.getParentDirectory();
-            }
-        }
-
-        juce::File linuxDefault ("/usr/local/google/home/mhorowitzgelb/improv_pulse/piano_samples");
-        if (linuxDefault.isDirectory())
-            return linuxDefault;
-
-        return juce::File::getCurrentWorkingDirectory().getChildFile ("piano_samples");
-    }
-
-    void run() override {
-        juce::AudioFormatManager formatManager;
-        formatManager.registerBasicFormats();
-
-        juce::File samplesDir = findPianoSamplesDir();
-        juce::File manifestFile = samplesDir.getChildFile ("manifest.csv");
-
-        if (! manifestFile.existsAsFile()) {
-            setStatus ("Error: manifest.csv not found in " + samplesDir.getFullPathName());
-            return;
-        }
-
-        juce::StringArray lines;
-        manifestFile.readLines (lines);
-
-        struct SampleEntry {
-            juce::String noteName;
-            int midiNote = 60;
-            juce::String dynamicLayer;
-            int velMin = 1;
-            int velMax = 127;
-            juce::File wavFile;
-            bool isPrimary = false;
-        };
-
-        std::vector<SampleEntry> primaryEntries;
-        std::vector<SampleEntry> secondaryEntries;
-
-        for (int i = 1; i < lines.size(); ++i) {
-            if (threadShouldExit())
-                return;
-
-            juce::String line = lines[i].trim();
-            if (line.isEmpty())
-                continue;
-
-            juce::StringArray tokens = juce::StringArray::fromTokens (line, ",", "");
-            if (tokens.size() < 11)
-                continue;
-
-            if (tokens[8].trim() != "True")
-                continue;
-
-            SampleEntry entry;
-            entry.noteName = tokens[0].trim();
-            entry.midiNote = tokens[1].getIntValue();
-            entry.dynamicLayer = tokens[5].trim();
-            entry.velMin = tokens[6].getIntValue();
-            entry.velMax = tokens[7].getIntValue();
-            entry.wavFile = samplesDir.getChildFile (tokens[10].trim());
-
-            if (! entry.wavFile.existsAsFile())
-                continue;
-
-            // Load 'mf' layer first (plus A0 ff and Bb0 pp which have no mf recording)
-            // so all 88 keys are playable almost immediately
-            if (entry.dynamicLayer == "mf" || entry.midiNote == 21 || entry.midiNote == 22) {
-                entry.isPrimary = true;
-                primaryEntries.push_back (entry);
-            } else {
-                secondaryEntries.push_back (entry);
-            }
-        }
-
-        const int total = static_cast<int> (primaryEntries.size() + secondaryEntries.size());
-        totalCount.store (total);
-        int count = 0;
-
-        auto loadEntry = [&] (const SampleEntry& entry) {
-            if (threadShouldExit())
-                return;
-
-            std::unique_ptr<juce::AudioFormatReader> rawReader (formatManager.createReaderFor (entry.wavFile));
-            if (rawReader == nullptr || rawReader->lengthInSamples <= 0)
-                return;
-
-            // Scan first 5 seconds to find peak and hammer strike transient (trim leading silence)
-            const juce::int64 scanSamples = std::min<juce::int64> (
-                rawReader->lengthInSamples,
-                static_cast<juce::int64> (rawReader->sampleRate * 5.0));
-
-            juce::AudioBuffer<float> scanBuf (static_cast<int> (rawReader->numChannels),
-                                              static_cast<int> (scanSamples));
-            rawReader->read (&scanBuf, 0, static_cast<int> (scanSamples), 0, true, true);
-
-            float maxPeak = scanBuf.getMagnitude (0, static_cast<int> (scanSamples));
-            const float threshold = std::max (0.0008f, maxPeak * 0.08f);
-
-            juce::int64 onsetSample = 0;
-            const int numCh = scanBuf.getNumChannels();
-            for (int s = 0; s < static_cast<int> (scanSamples); ++s) {
-                float mag = 0.0f;
-                for (int c = 0; c < numCh; ++c)
-                    mag = std::max (mag, std::abs (scanBuf.getSample (c, s)));
-                if (mag > threshold) {
-                    onsetSample = s;
-                    break;
-                }
-            }
-
-            // Keep 128 samples (~2.9 ms) before hammer transient
-            const juce::int64 startSample = std::max<juce::int64> (0, onsetSample - 128);
-            const double maxDurationSecs = (entry.midiNote < 48) ? 4.5 : ((entry.midiNote < 72) ? 3.5 : 2.5);
-            const juce::int64 maxLenSamples = std::min<juce::int64> (
-                rawReader->lengthInSamples - startSample,
-                static_cast<juce::int64> (rawReader->sampleRate * maxDurationSecs));
-
-            if (maxLenSamples <= 0)
-                return;
-
-            juce::AudioSubsectionReader subReader (rawReader.release(), startSample, maxLenSamples, true);
-
-            juce::BigInteger noteBits;
-            noteBits.setBit (entry.midiNote);
-
-            auto* sound = new PianoSamplerSound (
-                entry.noteName + "_" + entry.dynamicLayer,
-                subReader,
-                noteBits,
-                entry.midiNote,
-                0.002, // 2ms attack
-                0.45,  // 450ms natural damper release
-                maxDurationSecs,
-                entry.velMin,
-                entry.velMax);
-
-            // Normalize sample peak per dynamic layer for consistent keyboard balance
-            if (auto* audioData = sound->getAudioData()) {
-                const float peak = audioData->getMagnitude (0, audioData->getNumSamples());
-                if (peak > 0.0001f) {
-                    float targetPeak = 0.68f;
-                    if (entry.dynamicLayer == "pp") targetPeak = 0.38f;
-                    else if (entry.dynamicLayer == "ff") targetPeak = 0.95f;
-                    audioData->applyGain (targetPeak / peak);
-                }
-            }
-
-            synth.addSound (sound);
-            ++count;
-            loadedCount.store (count);
-            progress.store (static_cast<float> (count) / static_cast<float> (std::max (1, total)));
-        };
-
-        setStatus ("Loading primary Steinway Model B keys (mf layer)...");
-        for (const auto& entry : primaryEntries) {
-            if (threadShouldExit()) return;
-            loadEntry (entry);
-        }
-
-        primaryReady.store (true);
-        setStatus ("Playing 100 BPM E Minor Blues (loading pp/ff velocity layers in background...)");
-        if (onReady) {
-            juce::MessageManager::callAsync (onReady);
-        }
-
-        for (const auto& entry : secondaryEntries) {
-            if (threadShouldExit()) return;
-            loadEntry (entry);
-        }
-
-        setStatus ("Steinway Model B Ready - All 88 Keys & 3 Velocity Layers Loaded ("
-                   + juce::String (count) + " samples)");
-    }
-
-private:
-    void setStatus (const juce::String& text) {
-        const juce::ScopedLock sl (statusLock);
-        statusMessage = text;
-    }
-
-    PianoSynthesiser& synth;
-    std::function<void()> onReady;
-    std::atomic<float> progress { 0.0f };
-    std::atomic<int> loadedCount { 0 };
-    std::atomic<int> totalCount { 261 };
-    std::atomic<bool> primaryReady { false };
-    juce::CriticalSection statusLock;
-    juce::String statusMessage { "Initializing Steinway Sample Loader..." };
-};
 
 //==============================================================================
 // E Minor 12-Bar Blues Sequencer (48 Beats @ 100 BPM)
@@ -497,11 +201,6 @@ public:
         : keyboardComponent (keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard) {
         setSize (980, 680);
 
-        // Add 32 polyphonic voices to the Steinway synthesiser
-        synth.setNoteStealingEnabled (true);
-        for (int i = 0; i < 32; ++i)
-            synth.addVoice (new juce::SamplerVoice());
-
         // Setup UI controls
         addAndMakeVisible (playPauseButton);
         playPauseButton.setButtonText ("Pause");
@@ -529,6 +228,41 @@ public:
         arrangementCombo.setSelectedId (1, juce::dontSendNotification);
         arrangementCombo.onChange = [this] { updateSequencerSettings(); };
 
+        // Populate SFZ Preset selector (from sfz_instrument_loader)
+        availableSfzPresets = sfz::AsyncSfzLoaderThread::findAvailableSfzPresets();
+        addAndMakeVisible (sfzPresetCombo);
+        for (size_t i = 0; i < availableSfzPresets.size(); ++i) {
+            const juce::String fname = availableSfzPresets[i].getFileNameWithoutExtension();
+            juce::String label = fname;
+            if (fname.containsIgnoreCase ("flat.Recommended"))
+                label = "SFZ Tone: Flat (Recommended)";
+            else if (fname.containsIgnoreCase ("bass1.0db"))
+                label = "SFZ Tone: Bass +1.0 dB";
+            else if (fname.containsIgnoreCase ("bass1.5db"))
+                label = "SFZ Tone: Bass +1.5 dB";
+            else if (fname.containsIgnoreCase ("treble0.5db"))
+                label = "SFZ Tone: Treble +0.5 dB";
+            else if (fname.containsIgnoreCase ("treble1.0db"))
+                label = "SFZ Tone: Treble +1.0 dB";
+            else if (fname.containsIgnoreCase ("treble1.5db"))
+                label = "SFZ Tone: Treble +1.5 dB";
+            else if (fname.containsIgnoreCase ("treble2.0db"))
+                label = "SFZ Tone: Treble +2.0 dB";
+            else if (fname.containsIgnoreCase ("treble2.5db"))
+                label = "SFZ Tone: Treble +2.5 dB";
+
+            sfzPresetCombo.addItem (label, static_cast<int> (i + 1));
+        }
+        if (! availableSfzPresets.empty()) {
+            sfzPresetCombo.setSelectedId (1, juce::dontSendNotification);
+        }
+        sfzPresetCombo.onChange = [this] {
+            const int idx = sfzPresetCombo.getSelectedId() - 1;
+            if (idx >= 0 && idx < static_cast<int> (availableSfzPresets.size())) {
+                loadSfzInstrument (availableSfzPresets[static_cast<size_t> (idx)]);
+            }
+        };
+
         addAndMakeVisible (tempoSlider);
         tempoSlider.setRange (60.0, 160.0, 1.0);
         tempoSlider.setValue (100.0, juce::dontSendNotification);
@@ -545,7 +279,7 @@ public:
 
         addAndMakeVisible (volumeSlider);
         volumeSlider.setRange (0.0, 1.5, 0.01);
-        volumeSlider.setValue (0.85, juce::dontSendNotification);
+        volumeSlider.setValue (0.95, juce::dontSendNotification);
         volumeSlider.onValueChange = [this] {
             masterGain.store (static_cast<float> (volumeSlider.getValue()));
         };
@@ -556,18 +290,14 @@ public:
         keyboardComponent.setKeyWidth (16.5f);
         keyboardComponent.setScrollButtonsVisible (false);
 
-        // Start sample loader background thread
-        sampleLoader = std::make_unique<SampleLoaderThread> (synth, [this] {
-            if (! audioStarted) {
-                setAudioChannels (0, 2);
-                audioStarted = true;
-            }
-        });
-        sampleLoader->startThread();
-
-        // Start audio immediately (primary keys load in ~0.2s)
+        // Start audio immediately and launch SFZ loader background thread
         setAudioChannels (0, 2);
         audioStarted = true;
+
+        const juce::File defaultSfz = availableSfzPresets.empty()
+                                    ? sfz::AsyncSfzLoaderThread::findDefaultSfzFile()
+                                    : availableSfzPresets[0];
+        loadSfzInstrument (defaultSfz);
 
         startTimerHz (30); // 30 FPS UI refresh
     }
@@ -577,6 +307,23 @@ public:
         if (sampleLoader)
             sampleLoader->stopThread (4000);
         shutdownAudio();
+    }
+
+    void loadSfzInstrument (const juce::File& sfzFile) {
+        if (sampleLoader)
+            sampleLoader->stopThread (4000);
+
+        allNotesOffPending.store (true);
+        sampleLoader = std::make_unique<sfz::AsyncSfzLoaderThread> (
+            synth,
+            sfzFile,
+            [this] {
+                if (! audioStarted) {
+                    setAudioChannels (0, 2);
+                    audioStarted = true;
+                }
+            });
+        sampleLoader->startThread();
     }
 
     void updateSequencerSettings() {
@@ -680,7 +427,7 @@ public:
         // Process keyboard state so both sequencer notes and user mouse clicks update the UI keyboard
         keyboardState.processNextMidiBuffer (midiBuffer, 0, numSamples, true);
 
-        // Render Steinway Model B Sampler audio
+        // Render Accurate Salamander Grand Piano V6.2 SFZ audio
         synth.renderNextBlock (*bufferToFill.buffer, midiBuffer,
                                bufferToFill.startSample, numSamples);
 
@@ -711,7 +458,7 @@ public:
         // Top header takes 76px
         area.removeFromTop (76);
 
-        // Control strip takes 44px
+        // Control strip takes 40px
         auto controlRow = area.removeFromTop (40);
         playPauseButton.setBounds (controlRow.removeFromLeft (90).reduced (3));
         restartButton.setBounds (controlRow.removeFromLeft (115).reduced (3));
@@ -721,7 +468,8 @@ public:
         tempoSlider.setBounds (controlRow.removeFromRight (165).reduced (3));
 
         auto volRow = area.removeFromTop (32);
-        volumeSlider.setBounds (volRow.removeFromRight (220).reduced (2));
+        volumeSlider.setBounds (volRow.removeFromRight (210).reduced (2));
+        sfzPresetCombo.setBounds (volRow.removeFromRight (250).reduced (2));
 
         // Bottom piano keyboard takes 115px
         auto keyboardArea = area.removeFromBottom (115);
@@ -763,9 +511,9 @@ public:
         g.drawRoundedRectangle (headerArea.toFloat(), 8.0f, 1.2f);
 
         g.setColour (juce::Colours::white);
-        g.setFont (juce::FontOptions (22.0f, juce::Font::bold));
-        g.drawText ("Steinway Model B - 12-Bar E Minor Blues Sampler",
-                    headerArea.getX() + 16, headerArea.getY() + 8, 580, 28,
+        g.setFont (juce::FontOptions (21.0f, juce::Font::bold));
+        g.drawText ("Accurate Salamander Grand Piano V6.2 — 12-Bar E Minor Blues",
+                    headerArea.getX() + 16, headerArea.getY() + 8, 630, 28,
                     juce::Justification::centredLeft);
 
         const double activeBeat = displayBeat.load();
@@ -777,7 +525,7 @@ public:
             g.setFont (juce::FontOptions (13.5f));
             g.setColour (juce::Colour (0xffa6b4d0));
             g.drawText (sampleLoader->getStatusText(),
-                        headerArea.getX() + 16, headerArea.getY() + 38, 600, 22,
+                        headerArea.getX() + 16, headerArea.getY() + 38, 640, 22,
                         juce::Justification::centredLeft);
 
             // Progress bar
@@ -803,13 +551,13 @@ public:
                     headerArea.getRight() - 280, headerArea.getY() + 10, 265, 26,
                     juce::Justification::centredRight);
 
-        // Volume label
+        // Volume label & tip
         g.setFont (juce::FontOptions (13.0f));
         g.setColour (juce::Colour (0xff94a3b8));
-        g.drawText ("Master Volume:", volumeSlider.getX() - 105, volumeSlider.getY(), 100, 28,
+        g.drawText ("Volume:", volumeSlider.getX() - 62, volumeSlider.getY(), 58, 28,
                     juce::Justification::centredRight);
         g.drawText ("Click any bar card below to jump directly to that chord",
-                    20, volumeSlider.getY(), 420, 28,
+                    20, volumeSlider.getY(), 400, 28,
                     juce::Justification::centredLeft);
 
         // 2. 12-Bar Chord Progression Grid
@@ -888,8 +636,9 @@ public:
     }
 
 private:
-    PianoSynthesiser synth;
-    std::unique_ptr<SampleLoaderThread> sampleLoader;
+    sfz::SfzSynthesiser synth;
+    std::unique_ptr<sfz::AsyncSfzLoaderThread> sampleLoader;
+    std::vector<juce::File> availableSfzPresets;
     EMinorBluesSequencer sequencer;
     juce::CriticalSection sequencerLock;
 
@@ -900,6 +649,7 @@ private:
     juce::TextButton restartButton;
     juce::ComboBox turnaroundCombo;
     juce::ComboBox arrangementCombo;
+    juce::ComboBox sfzPresetCombo;
     juce::Slider tempoSlider;
     juce::TextButton resetTempoButton;
     juce::Slider volumeSlider;
@@ -909,7 +659,7 @@ private:
 
     std::atomic<double> currentSampleRate { 44100.0 };
     std::atomic<double> bpm { 100.0 };
-    std::atomic<float> masterGain { 0.85f };
+    std::atomic<float> masterGain { 0.95f };
     std::atomic<bool> isPlaying { true };
     std::atomic<bool> allNotesOffPending { false };
     std::atomic<double> requestJumpToBeat { -1.0 };
@@ -928,7 +678,7 @@ class PianoDemoApplication : public juce::JUCEApplication {
 public:
     PianoDemoApplication() {}
     const juce::String getApplicationName() override { return "PianoDemo"; }
-    const juce::String getApplicationVersion() override { return "1.0.0"; }
+    const juce::String getApplicationVersion() override { return "2.0.0"; }
 
     void initialise (const juce::String&) override {
         mainWindow.reset (new MainWindow (getApplicationName()));
