@@ -1,0 +1,24 @@
+# Build directories and CMake artifacts
+build/
+**/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# Exclude 2.7 GB raw audio recordings (can be downloaded via download_and_organize_piano.py)
+# Keep manifest.csv, manifest.json, piano.sfz, piano_wav.sfz, and README.md
+piano_samples/ff/
+piano_samples/mf/
+piano_samples/pp/
+piano_samples/wav/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
